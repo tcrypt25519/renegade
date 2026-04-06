@@ -1,7 +1,7 @@
 //! Defines a task to settle an internal match
 
-use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::cmp::Ordering;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use alloy::rpc::types::TransactionReceipt;
 use ark_mpc::{PARTY0, PARTY1, network::PartyId};
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use state::error::StateError;
 use tracing::instrument;
 use types_account::OrderId;
-use types_account::balance::Balance;
+use types_account::balance::{Balance, BalanceLocation};
 use types_account::order::{Order, PrivacyRing};
 use types_core::MatchResult;
 use types_core::{AccountId, TimestampedPriceFp};
@@ -49,23 +49,37 @@ pub enum SettleInternalMatchTaskState {
     /// The task is updating the account state for the parties involved in the
     /// match
     UpdatingState {
-        /// The initiating order after settlement-derived intent updates
-        updated_order0: Order,
-        /// The counterparty order after settlement-derived intent updates
-        updated_order1: Order,
-        /// The updated input balance for party 0 (Ring 2+ only)
-        updated_input_balance0: Option<Balance>,
-        /// The updated input balance for party 1 (Ring 2+ only)
-        updated_input_balance1: Option<Balance>,
-        /// The updated output balance for party 0 (Ring 2+ only)
-        updated_output_balance0: Option<Balance>,
-        /// The updated output balance for party 1 (Ring 2+ only)
-        updated_output_balance1: Option<Balance>,
+        /// The persisted apply plan for party 0
+        party0: PartyStateTransition,
+        /// The persisted apply plan for party 1
+        party1: PartyStateTransition,
     },
     /// The task is regenerating validity proofs for private (Ring 1+) orders
     UpdatingValidityProofs,
     /// The task is completed
     Completed,
+}
+
+/// The exact before/after local state transition for one party in a settled
+/// match.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartyStateTransition {
+    /// The account that owns the order.
+    account_id: AccountId,
+    /// The order ID being updated.
+    order_id: OrderId,
+    /// The local order state before applying the post-settlement transition.
+    order_before: Order,
+    /// The local order state after applying the post-settlement transition.
+    order_after: Order,
+    /// The input balance before applying the transition, if locally managed.
+    input_balance_before: Option<Balance>,
+    /// The input balance after applying the transition, if locally managed.
+    input_balance_after: Option<Balance>,
+    /// The output balance before applying the transition, if locally managed.
+    output_balance_before: Option<Balance>,
+    /// The output balance after applying the transition, if locally managed.
+    output_balance_after: Option<Balance>,
 }
 
 impl SettleInternalMatchTaskState {
@@ -214,6 +228,8 @@ pub struct SettleInternalMatchTask {
     pub processor: SettlementProcessor,
     /// The context of the task
     pub ctx: TaskContext,
+    /// Whether this task was reconstructed from persisted queue state
+    pub restored_from_queue: bool,
 }
 
 #[async_trait]
@@ -240,7 +256,23 @@ impl Task for SettleInternalMatchTask {
             task_state: SettleInternalMatchTaskState::Pending,
             processor,
             ctx,
+            restored_from_queue: false,
         })
+    }
+
+    fn restore_state(&mut self, state: Self::State) {
+        self.restored_from_queue = true;
+
+        if let SettleInternalMatchTaskState::UpdatingState { party0, party1 } = &state {
+            self.updated_order0 = Some(party0.order_after.clone());
+            self.updated_order1 = Some(party1.order_after.clone());
+            self.updated_input_balance0 = party0.input_balance_after.clone();
+            self.updated_input_balance1 = party1.input_balance_after.clone();
+            self.updated_output_balance0 = party0.output_balance_after.clone();
+            self.updated_output_balance1 = party1.output_balance_after.clone();
+        }
+
+        self.task_state = state;
     }
 
     #[allow(clippy::blocks_in_conditions)]
@@ -252,36 +284,16 @@ impl Task for SettleInternalMatchTask {
                 self.task_state = SettleInternalMatchTaskState::SubmittingTx;
             },
             SettleInternalMatchTaskState::SubmittingTx => {
-                self.submit_tx().await?;
-
-                // After `submit_tx` the `updated_...` fields are populated on `self`
-                // Transition to `UpdatingState` with this info to persist it
-                self.task_state = SettleInternalMatchTaskState::UpdatingState {
-                    updated_order0: self.updated_order0.clone().unwrap(),
-                    updated_order1: self.updated_order1.clone().unwrap(),
-                    updated_input_balance0: self.updated_input_balance0.clone(),
-                    updated_input_balance1: self.updated_input_balance1.clone(),
-                    updated_output_balance0: self.updated_output_balance0.clone(),
-                    updated_output_balance1: self.updated_output_balance1.clone(),
+                let (party0, party1) = if self.restored_from_queue {
+                    self.recover_submitted_match().await?
+                } else {
+                    self.submit_tx().await?
                 };
+                self.restored_from_queue = false;
+                self.task_state = SettleInternalMatchTaskState::UpdatingState { party0, party1 };
             },
-            SettleInternalMatchTaskState::UpdatingState {
-                updated_order0,
-                updated_order1,
-                updated_input_balance0,
-                updated_input_balance1,
-                updated_output_balance0,
-                updated_output_balance1,
-            } => {
-                self.update_state(
-                    updated_order0,
-                    updated_order1,
-                    updated_input_balance0,
-                    updated_input_balance1,
-                    updated_output_balance0,
-                    updated_output_balance1,
-                )
-                .await?;
+            SettleInternalMatchTaskState::UpdatingState { party0, party1 } => {
+                self.update_state(party0, party1).await?;
                 self.task_state = SettleInternalMatchTaskState::UpdatingValidityProofs;
             },
             SettleInternalMatchTaskState::UpdatingValidityProofs => {
@@ -308,7 +320,6 @@ impl Task for SettleInternalMatchTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
-
 
     // Re-run the matching engine on both orders for recursive fills
     fn success_hooks(&self) -> Vec<Box<dyn TaskHook>> {
@@ -338,7 +349,9 @@ impl SettleInternalMatchTask {
     /// After the transaction lands, Merkle proofs are extracted from the
     /// receipt for any Ring 1+ orders so subsequent validity proofs can
     /// reference the new Merkle leaf.
-    async fn submit_tx(&mut self) -> Result<()> {
+    async fn submit_tx(&mut self) -> Result<(PartyStateTransition, PartyStateTransition)> {
+        let party0_before = self.capture_party_state(PARTY0).await?;
+        let party1_before = self.capture_party_state(PARTY1).await?;
         let obligation_bundle = self.processor.public_obligation_bundle(&self.match_result);
         let obligation0 = self.get_obligation(PARTY0)?.clone();
         let obligation1 = self.get_obligation(PARTY1)?.clone();
@@ -370,7 +383,45 @@ impl SettleInternalMatchTask {
 
         // Extract and store Merkle proofs for Ring 1+ orders
         self.update_merkle_proofs(&receipt).await?;
-        Ok(())
+
+        let party0 = self.build_state_transition(PARTY0, party0_before)?;
+        let party1 = self.build_state_transition(PARTY1, party1_before)?;
+        Ok((party0, party1))
+    }
+
+    /// Recover a committed settlement task from `SubmittingTx` without
+    /// re-submitting the transaction.
+    ///
+    /// This path only proceeds when the chain can prove the first leg
+    /// finalized.
+    async fn recover_submitted_match(
+        &mut self,
+    ) -> Result<(PartyStateTransition, PartyStateTransition)> {
+        let party0_before = self.capture_party_state(PARTY0).await?;
+        let party1_before = self.capture_party_state(PARTY1).await?;
+        let obligation0 = self.get_obligation(PARTY0)?.clone();
+        let obligation1 = self.get_obligation(PARTY1)?.clone();
+
+        let order0 = self.processor.build_updated_intent(self.order_id, &obligation0).await?;
+        let order1 = self.processor.build_updated_intent(self.other_order_id, &obligation1).await?;
+        self.updated_order0 = Some(order0.clone());
+        self.updated_order1 = Some(order1.clone());
+        self.build_updated_balances_for_party(PARTY0, &obligation0).await?;
+        self.build_updated_balances_for_party(PARTY1, &obligation1).await?;
+
+        let party0 = self.build_state_transition(PARTY0, party0_before)?;
+        let party1 = self.build_state_transition(PARTY1, party1_before)?;
+
+        if !self.first_leg_finalized(&party0).await? || !self.first_leg_finalized(&party1).await? {
+            return Err(SettlementError::darkpool(
+                "recovered settlement is still in SubmittingTx and chain finalization could not be proven; refusing to apply local state",
+            )
+            .into());
+        }
+
+        self.sync_recovery_merkle_proofs(&party0).await?;
+        self.sync_recovery_merkle_proofs(&party1).await?;
+        Ok((party0, party1))
     }
 
     /// Extract and store Merkle proofs for both parties from the settlement
@@ -444,25 +495,11 @@ impl SettleInternalMatchTask {
     /// amount is decremented.
     async fn update_state(
         &self,
-        updated_order0: Order,
-        updated_order1: Order,
-        updated_input_balance0: Option<Balance>,
-        updated_input_balance1: Option<Balance>,
-        updated_output_balance0: Option<Balance>,
-        updated_output_balance1: Option<Balance>,
+        party0: PartyStateTransition,
+        party1: PartyStateTransition,
     ) -> Result<()> {
-        let party0_fut = self.update_state_for_party(
-            PARTY0,
-            updated_order0,
-            updated_input_balance0,
-            updated_output_balance0,
-        );
-        let party1_fut = self.update_state_for_party(
-            PARTY1,
-            updated_order1,
-            updated_input_balance1,
-            updated_output_balance1,
-        );
+        let party0_fut = self.update_state_for_party(PARTY0, party0);
+        let party1_fut = self.update_state_for_party(PARTY1, party1);
         tokio::try_join!(party0_fut, party1_fut)?;
         Ok(())
     }
@@ -471,21 +508,38 @@ impl SettleInternalMatchTask {
     async fn update_state_for_party(
         &self,
         party_id: PartyId,
-        order: Order,
-        input_balance: Option<Balance>,
-        output_balance: Option<Balance>,
+        transition: PartyStateTransition,
     ) -> Result<()> {
         let account_id = branch_party!(party_id, self.account_id, self.other_account_id);
         let obligation = self.get_obligation(party_id)?;
+        let current = self.capture_party_state(party_id).await?;
+        let already_applied = current == PartyLocalState::from_after(&transition);
+        if already_applied {
+            return Ok(());
+        }
+
+        if current != PartyLocalState::from_before(&transition) {
+            return Err(SettlementError::state(format!(
+                "recovered settlement for order {} is in an unexpected local state; refusing to replay",
+                transition.order_id
+            ))
+            .into());
+        }
 
         // Update the balances for the party
-        let updated_balances = input_balance.zip(output_balance);
+        let updated_balances =
+            transition.input_balance_after.clone().zip(transition.output_balance_after.clone());
         self.processor
-            .update_balances_after_match(account_id, &order, obligation, updated_balances)
+            .update_balances_after_match(
+                account_id,
+                &transition.order_after,
+                obligation,
+                updated_balances,
+            )
             .await?;
 
         // Update the order after settlement
-        self.processor.update_order_after_match(order).await?;
+        self.processor.update_order_after_match(transition.order_after).await?;
         Ok(())
     }
 
@@ -553,6 +607,159 @@ impl SettleInternalMatchTask {
 // -----------
 
 impl SettleInternalMatchTask {
+    /// Capture the current local state for a party.
+    async fn capture_party_state(&self, party_id: PartyId) -> Result<PartyLocalState> {
+        let account_id = branch_party!(party_id, self.account_id, self.other_account_id);
+        let order_id = branch_party!(party_id, self.order_id, self.other_order_id);
+        let order = self.processor.get_order(order_id).await?;
+        let location = order.ring.balance_location();
+        let input_balance =
+            self.ctx.state.get_account_balance(&account_id, &order.input_token(), location).await?;
+        let output_balance = match location {
+            BalanceLocation::EOA => None,
+            BalanceLocation::Darkpool => {
+                self.ctx
+                    .state
+                    .get_account_balance(&account_id, &order.output_token(), location)
+                    .await?
+            },
+        };
+
+        Ok(PartyLocalState { account_id, order_id, order, input_balance, output_balance })
+    }
+
+    /// Build a persisted before/after transition for one party.
+    fn build_state_transition(
+        &self,
+        party_id: PartyId,
+        before: PartyLocalState,
+    ) -> Result<PartyStateTransition> {
+        let order_after = branch_party!(party_id, &self.updated_order0, &self.updated_order1)
+            .clone()
+            .ok_or_else(|| {
+                SettleInternalMatchTaskError::Settlement(
+                    "updated order missing while building settlement recovery state".to_string(),
+                )
+            })?;
+        let input_balance_after =
+            branch_party!(party_id, &self.updated_input_balance0, &self.updated_input_balance1)
+                .clone();
+        let output_balance_after =
+            branch_party!(party_id, &self.updated_output_balance0, &self.updated_output_balance1)
+                .clone();
+
+        Ok(PartyStateTransition {
+            account_id: before.account_id,
+            order_id: before.order_id,
+            order_before: before.order,
+            order_after,
+            input_balance_before: before.input_balance,
+            input_balance_after,
+            output_balance_before: before.output_balance,
+            output_balance_after,
+        })
+    }
+
+    /// Prove that the first, on-chain leg of the settlement finalized for a
+    /// party.
+    async fn first_leg_finalized(&self, transition: &PartyStateTransition) -> Result<bool> {
+        match transition.order_after.ring {
+            PrivacyRing::Ring0 => Ok(false),
+            PrivacyRing::Ring1 | PrivacyRing::Ring2 | PrivacyRing::Ring3 => {
+                let order_commitment = transition.order_after.intent.compute_commitment();
+                if self
+                    .ctx
+                    .darkpool_client
+                    .find_commitment_in_state_with_tx(order_commitment)
+                    .await
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+
+                if transition.order_after.ring != PrivacyRing::Ring2 {
+                    return Ok(true);
+                }
+
+                let input_commitment = transition
+                    .input_balance_after
+                    .as_ref()
+                    .expect("ring 2 input balance must be present")
+                    .state_wrapper
+                    .compute_commitment();
+                let output_commitment = transition
+                    .output_balance_after
+                    .as_ref()
+                    .expect("ring 2 output balance must be present")
+                    .state_wrapper
+                    .compute_commitment();
+
+                let input_found = self
+                    .ctx
+                    .darkpool_client
+                    .find_commitment_in_state_with_tx(input_commitment)
+                    .await
+                    .is_ok();
+                let output_found = self
+                    .ctx
+                    .darkpool_client
+                    .find_commitment_in_state_with_tx(output_commitment)
+                    .await
+                    .is_ok();
+                Ok(input_found && output_found)
+            },
+        }
+    }
+
+    /// Rebuild local Merkle proofs from chain for a recovered task whose first
+    /// leg finalized.
+    async fn sync_recovery_merkle_proofs(&self, transition: &PartyStateTransition) -> Result<()> {
+        if transition.order_after.ring != PrivacyRing::Ring0 {
+            let commitment = transition.order_after.intent.compute_commitment();
+            let merkle_proof =
+                self.ctx.darkpool_client.find_merkle_authentication_path(commitment).await?;
+            let waiter = self
+                .ctx
+                .state
+                .add_intent_merkle_proof(transition.order_after.id, merkle_proof)
+                .await?;
+            waiter.await?;
+        }
+
+        if transition.order_after.ring == PrivacyRing::Ring2 {
+            self.sync_balance_merkle_proof(
+                transition.account_id,
+                transition.input_balance_after.as_ref().expect("ring 2 input balance must exist"),
+            )
+            .await?;
+            self.sync_balance_merkle_proof(
+                transition.account_id,
+                transition.output_balance_after.as_ref().expect("ring 2 output balance must exist"),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Rebuild a single balance Merkle proof from chain.
+    async fn sync_balance_merkle_proof(
+        &self,
+        account_id: AccountId,
+        balance: &Balance,
+    ) -> Result<()> {
+        let commitment = balance.state_wrapper.compute_commitment();
+        let merkle_proof =
+            self.ctx.darkpool_client.find_merkle_authentication_path(commitment).await?;
+        let waiter = self
+            .ctx
+            .state
+            .add_balance_merkle_proof(account_id, balance.mint(), merkle_proof)
+            .await?;
+        waiter.await?;
+        Ok(())
+    }
+
     /// Get the obligation for a given party
     fn get_obligation(&self, party_id: PartyId) -> Result<&SettlementObligation> {
         let obligation = branch_party!(
@@ -606,5 +813,38 @@ impl SettleInternalMatchTask {
         }
 
         Ok(())
+    }
+}
+
+/// The current local state for one party while deciding whether the second leg
+/// needs applying.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PartyLocalState {
+    account_id: AccountId,
+    order_id: OrderId,
+    order: Order,
+    input_balance: Option<Balance>,
+    output_balance: Option<Balance>,
+}
+
+impl PartyLocalState {
+    fn from_before(transition: &PartyStateTransition) -> Self {
+        Self {
+            account_id: transition.account_id,
+            order_id: transition.order_id,
+            order: transition.order_before.clone(),
+            input_balance: transition.input_balance_before.clone(),
+            output_balance: transition.output_balance_before.clone(),
+        }
+    }
+
+    fn from_after(transition: &PartyStateTransition) -> Self {
+        Self {
+            account_id: transition.account_id,
+            order_id: transition.order_id,
+            order: transition.order_after.clone(),
+            input_balance: transition.input_balance_after.clone(),
+            output_balance: transition.output_balance_after.clone(),
+        }
     }
 }
