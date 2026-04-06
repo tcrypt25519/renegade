@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
-use alloy::rpc::types::TransactionReceipt;
+use alloy::{primitives::keccak256, rpc::types::TransactionReceipt, sol_types::SolValue};
 use ark_mpc::{PARTY0, PARTY1, network::PartyId};
 use async_trait::async_trait;
 use darkpool_client::errors::DarkpoolClientError;
@@ -401,13 +401,8 @@ impl SettleInternalMatchTask {
         let party1_before = self.capture_party_state(PARTY1).await?;
         let obligation0 = self.get_obligation(PARTY0)?.clone();
         let obligation1 = self.get_obligation(PARTY1)?.clone();
-
-        let order0 = self.processor.build_updated_intent(self.order_id, &obligation0).await?;
-        let order1 = self.processor.build_updated_intent(self.other_order_id, &obligation1).await?;
-        self.updated_order0 = Some(order0.clone());
-        self.updated_order1 = Some(order1.clone());
-        self.build_updated_balances_for_party(PARTY0, &obligation0).await?;
-        self.build_updated_balances_for_party(PARTY1, &obligation1).await?;
+        self.rebuild_recovered_state_for_party(PARTY0, &party0_before, &obligation0).await?;
+        self.rebuild_recovered_state_for_party(PARTY1, &party1_before, &obligation1).await?;
 
         let party0 = self.build_state_transition(PARTY0, party0_before)?;
         let party1 = self.build_state_transition(PARTY1, party1_before)?;
@@ -607,6 +602,72 @@ impl SettleInternalMatchTask {
 // -----------
 
 impl SettleInternalMatchTask {
+    /// Rebuild the expected post-settlement state for one party during
+    /// recovery.
+    async fn rebuild_recovered_state_for_party(
+        &mut self,
+        party_id: PartyId,
+        before: &PartyLocalState,
+        obligation: &SettlementObligation,
+    ) -> Result<()> {
+        match before.order.ring {
+            PrivacyRing::Ring0 => {
+                self.rebuild_ring0_recovered_state_for_party(party_id, before, obligation).await
+            },
+            _ => {
+                let order_id = branch_party!(party_id, self.order_id, self.other_order_id);
+                let order = self.processor.build_updated_intent(order_id, obligation).await?;
+                match party_id {
+                    PARTY0 => self.updated_order0 = Some(order),
+                    PARTY1 => self.updated_order1 = Some(order),
+                    _ => unreachable!("invalid party ID: {party_id}"),
+                }
+
+                self.build_updated_balances_for_party(party_id, obligation).await
+            },
+        }
+    }
+
+    /// Rebuild Ring 0 post-settlement state from the latest on-chain public
+    /// intent update rather than decrementing local order state again.
+    async fn rebuild_ring0_recovered_state_for_party(
+        &mut self,
+        party_id: PartyId,
+        before: &PartyLocalState,
+        obligation: &SettlementObligation,
+    ) -> Result<()> {
+        let order_id = branch_party!(party_id, self.order_id, self.other_order_id);
+        let (permit, _) = self.processor.get_public_intent_auth(order_id).await?;
+        let intent_hash = keccak256(permit.abi_encode());
+        let (amount_remaining, _) =
+            self.ctx.darkpool_client.find_public_intent_update_with_tx(intent_hash).await?;
+
+        let mut order = before.order.clone();
+        order.intent.inner.amount_in = amount_remaining;
+        order.metadata.mark_filled();
+
+        let updated_input_balance = before.input_balance.as_ref().cloned().map(|mut balance| {
+            *balance.amount_mut() -= obligation.amount_in;
+            balance
+        });
+
+        match party_id {
+            PARTY0 => {
+                self.updated_order0 = Some(order);
+                self.updated_input_balance0 = updated_input_balance;
+                self.updated_output_balance0 = None;
+            },
+            PARTY1 => {
+                self.updated_order1 = Some(order);
+                self.updated_input_balance1 = updated_input_balance;
+                self.updated_output_balance1 = None;
+            },
+            _ => unreachable!("invalid party ID: {party_id}"),
+        }
+
+        Ok(())
+    }
+
     /// Capture the current local state for a party.
     async fn capture_party_state(&self, party_id: PartyId) -> Result<PartyLocalState> {
         let account_id = branch_party!(party_id, self.account_id, self.other_account_id);
@@ -643,7 +704,20 @@ impl SettleInternalMatchTask {
             })?;
         let input_balance_after =
             branch_party!(party_id, &self.updated_input_balance0, &self.updated_input_balance1)
-                .clone();
+                .clone()
+                .or_else(|| {
+                    if before.order.ring.balance_location() == BalanceLocation::EOA {
+                        before.input_balance.clone().map(|mut balance| {
+                            let obligation = self.get_obligation(party_id).expect(
+                                "obligation must exist while building settlement recovery state",
+                            );
+                            *balance.amount_mut() -= obligation.amount_in;
+                            balance
+                        })
+                    } else {
+                        None
+                    }
+                });
         let output_balance_after =
             branch_party!(party_id, &self.updated_output_balance0, &self.updated_output_balance1)
                 .clone();
@@ -664,7 +738,22 @@ impl SettleInternalMatchTask {
     /// party.
     async fn first_leg_finalized(&self, transition: &PartyStateTransition) -> Result<bool> {
         match transition.order_after.ring {
-            PrivacyRing::Ring0 => Ok(false),
+            PrivacyRing::Ring0 => {
+                let (permit, _) =
+                    self.processor.get_public_intent_auth(transition.order_id).await?;
+                let intent_hash = keccak256(permit.abi_encode());
+                let (amount_remaining, _) = match self
+                    .ctx
+                    .darkpool_client
+                    .find_public_intent_update_with_tx(intent_hash)
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(_) => return Ok(false),
+                };
+
+                Ok(amount_remaining == transition.order_after.intent.inner.amount_in)
+            },
             PrivacyRing::Ring1 | PrivacyRing::Ring2 | PrivacyRing::Ring3 => {
                 let order_commitment = transition.order_after.intent.compute_commitment();
                 if self

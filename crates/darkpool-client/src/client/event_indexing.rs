@@ -21,7 +21,7 @@ use darkpool_types::bounded_match_result::BoundedMatchResult;
 use itertools::Itertools;
 use renegade_solidity_abi::v2::IDarkpoolV2::{
     self, MerkleInsertion as AbiMerkleInsertion, MerkleOpeningNode as AbiMerkleOpeningNode,
-    PublicIntentPublicBalanceBundle, SettlementBundle,
+    PublicIntentPublicBalanceBundle, PublicIntentUpdated, SettlementBundle,
 };
 use renegade_solidity_abi::v2::calldata_bundles::NATIVE_SETTLED_PUBLIC_INTENT_BUNDLE_TYPE;
 use renegade_solidity_abi::v2::relayer_types::u256_to_u128;
@@ -142,6 +142,30 @@ impl DarkpoolClient {
             .ok_or(DarkpoolClientError::CommitmentNotFound)?;
 
         Ok((event.index, log.transaction_hash.expect(ERR_NO_TX_HASH)))
+    }
+
+    /// Find the most recent `PublicIntentUpdated` event for a given intent
+    /// hash, returning the remaining amount and tx hash.
+    #[instrument(skip_all, err, fields(intent_hash = ?intent_hash))]
+    pub async fn find_public_intent_update_with_tx(
+        &self,
+        intent_hash: B256,
+    ) -> Result<(Amount, TxHash), DarkpoolClientError> {
+        let filter = self
+            .event_filter::<PublicIntentUpdated>()
+            .topic1(intent_hash)
+            .from_block(self.deploy_block);
+        let (event, log) = self
+            .query_latest_event(filter)
+            .await?
+            .ok_or(DarkpoolClientError::CommitmentNotFound)?;
+        let amount_remaining = event.amountRemaining.try_into().map_err(|_| {
+            DarkpoolClientError::EventQuerying(
+                "public intent amount remaining overflow".to_string(),
+            )
+        })?;
+
+        Ok((amount_remaining, log.transaction_hash.expect(ERR_NO_TX_HASH)))
     }
 
     /// Fetch all external matches in a given transaction

@@ -68,7 +68,7 @@ impl SettlementProcessor {
     // --- Auth Retrieval --- //
 
     /// Get the public intent auth (permit + signature) for an order
-    async fn get_public_intent_auth(
+    pub async fn get_public_intent_auth(
         &self,
         order_id: OrderId,
     ) -> Result<(PublicIntentPermit, SignatureWithNonce), SettlementError> {
