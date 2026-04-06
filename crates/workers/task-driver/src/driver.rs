@@ -17,6 +17,7 @@ use util::{
 use crate::{
     error::TaskDriverError,
     running_task::RunnableTask,
+    task_state::decode_task_state,
     tasks::{
         cancel_order::CancelOrderTask,
         create_balance::CreateBalanceTask,
@@ -229,40 +230,88 @@ impl TaskExecutor {
             notifications_locked.entry(id).or_default().push(c);
         }
 
+        let queued_state = task.state.clone();
+
         // Construct the task from the descriptor
         let res: Result<(), TaskDriverError> = match task.descriptor {
             TaskDescriptor::NewAccount(desc) => {
-                self.start_task_helper::<CreateNewAccountTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<CreateNewAccountTask>(
+                    id,
+                    desc,
+                    queued_state,
+                    affected_accounts,
+                )
+                .await
             },
             TaskDescriptor::NodeStartup(desc) => {
-                self.start_task_helper::<NodeStartupTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<NodeStartupTask>(id, desc, queued_state, affected_accounts)
+                    .await
             },
             TaskDescriptor::Deposit(desc) => {
-                self.start_task_helper::<DepositTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<DepositTask>(id, desc, queued_state, affected_accounts)
+                    .await
             },
             TaskDescriptor::CreateBalance(desc) => {
-                self.start_task_helper::<CreateBalanceTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<CreateBalanceTask>(
+                    id,
+                    desc,
+                    queued_state,
+                    affected_accounts,
+                )
+                .await
             },
             TaskDescriptor::CreateOrder(desc) => {
-                self.start_task_helper::<CreateOrderTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<CreateOrderTask>(id, desc, queued_state, affected_accounts)
+                    .await
             },
             TaskDescriptor::CancelOrder(desc) => {
-                self.start_task_helper::<CancelOrderTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<CancelOrderTask>(
+                    id,
+                    desc,
+                    queued_state,
+                    affected_accounts,
+                )
+                .await
             },
             TaskDescriptor::RefreshAccount(desc) => {
-                self.start_task_helper::<RefreshAccountTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<RefreshAccountTask>(
+                    id,
+                    desc,
+                    queued_state,
+                    affected_accounts,
+                )
+                .await
             },
             TaskDescriptor::SettleInternalMatch(desc) => {
-                self.start_task_helper::<SettleInternalMatchTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<SettleInternalMatchTask>(
+                    id,
+                    desc,
+                    queued_state,
+                    affected_accounts,
+                )
+                .await
             },
             TaskDescriptor::SettleExternalMatch(desc) => {
-                self.start_task_helper::<SettleExternalMatchTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<SettleExternalMatchTask>(
+                    id,
+                    desc,
+                    queued_state,
+                    affected_accounts,
+                )
+                .await
             },
             TaskDescriptor::SettlePrivateMatch(desc) => {
-                self.start_task_helper::<SettlePrivateMatchTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<SettlePrivateMatchTask>(
+                    id,
+                    desc,
+                    queued_state,
+                    affected_accounts,
+                )
+                .await
             },
             TaskDescriptor::Withdraw(desc) => {
-                self.start_task_helper::<WithdrawTask>(id, desc, affected_accounts).await
+                self.start_task_helper::<WithdrawTask>(id, desc, queued_state, affected_accounts)
+                    .await
             },
         };
 
@@ -281,6 +330,7 @@ impl TaskExecutor {
         &self,
         id: TaskIdentifier,
         descriptor: T::Descriptor,
+        queued_state: types_tasks::QueuedTaskState,
         affected_accounts: Vec<AccountId>,
     ) -> Result<(), TaskDriverError> {
         // Collect the arguments then spawn
@@ -289,7 +339,9 @@ impl TaskExecutor {
 
         // Create and run the task
         let bypasses_queue = descriptor.bypass_task_queue();
-        let task_res = RunnableTask::<T>::from_descriptor(id, descriptor, ctx).await;
+        let restored_state =
+            decode_task_state::<T::State>(&queued_state).map_err(|e| TaskDriverError::TaskStateDecode(e.to_string()))?;
+        let task_res = RunnableTask::<T>::restore(id, descriptor, restored_state, ctx).await;
 
         // If we fail to create the task, pop it from the queue (if necessary) so it
         // isn't stuck there in a pending state

@@ -16,7 +16,7 @@ use darkpool_client::{DarkpoolClient, errors::DarkpoolClientError};
 use darkpool_types::{balance::DarkpoolBalance, deposit::Deposit, state_wrapper::StateWrapper};
 use job_types::proof_manager::ProofJob;
 use renegade_solidity_abi::v2::IDarkpoolV2::DepositAuth;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::{State, error::StateError};
 use tracing::{info, instrument};
 use types_account::{balance::Balance, keychain::KeyChain};
@@ -40,7 +40,7 @@ const CREATE_BALANCE_TASK_NAME: &str = "create-balance";
 // --------------
 
 /// Represents the state of the task through its async execution
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CreateBalanceTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -241,6 +241,7 @@ impl Task for CreateBalanceTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 
     fn failure_hooks(&self) -> Vec<Box<dyn TaskHook>> {
         let refresh = RefreshAccountHook::new(vec![self.account_id]);

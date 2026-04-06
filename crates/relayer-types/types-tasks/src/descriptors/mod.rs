@@ -97,6 +97,9 @@ pub enum QueuedTaskState {
         state: String,
         /// Whether the task has committed or not
         committed: bool,
+        /// An optional serialized execution state payload for task recovery
+        #[serde(default)]
+        execution_state: Option<String>,
     },
     /// The task is completed
     Completed,
@@ -114,6 +117,14 @@ impl QueuedTaskState {
     /// Whether the task is committed
     pub fn is_committed(&self) -> bool {
         matches!(self, QueuedTaskState::Running { committed: true, .. })
+    }
+
+    /// Get the serialized execution state payload if one exists
+    pub fn execution_state(&self) -> Option<&str> {
+        match self {
+            QueuedTaskState::Running { execution_state, .. } => execution_state.as_deref(),
+            _ => None,
+        }
     }
 
     /// Get a human-readable description of the task state

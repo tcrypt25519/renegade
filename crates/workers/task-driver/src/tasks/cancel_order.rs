@@ -5,7 +5,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use async_trait::async_trait;
 use darkpool_client::errors::DarkpoolClientError;
 use renegade_solidity_abi::v2::IDarkpoolV2::{OrderCancellationAuth, SignatureWithNonce};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::{State, error::StateError};
 use tracing::{info, instrument};
 use types_account::{OrderId, order::PrivacyRing, order_auth::OrderAuth};
@@ -26,7 +26,7 @@ const CANCEL_ORDER_TASK_NAME: &str = "cancel-order";
 // --------------
 
 /// Represents the state of the task through its async execution
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CancelOrderTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -190,6 +190,7 @@ impl Task for CancelOrderTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 
     // Refresh the account after a failure
     fn failure_hooks(&self) -> Vec<Box<dyn TaskHook>> {

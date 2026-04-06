@@ -2,7 +2,7 @@
 
 use std::fmt::Display;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use types_tasks::QueuedTaskState;
 
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
 // --------------------
 
 /// Defines a wrapper that allows state objects to be stored generically
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "task_type", content = "state")]
 pub enum TaskStateWrapper {
@@ -52,6 +52,14 @@ pub enum TaskStateWrapper {
 }
 
 impl TaskStateWrapper {
+    /// Deserialize a typed task-state payload from a queued task state
+    pub fn from_queued_task_state(state: &QueuedTaskState) -> Result<Option<Self>, serde_json::Error> {
+        match state.execution_state() {
+            Some(serialized) => serde_json::from_str(serialized).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Whether the underlying state is committed or not
     pub fn committed(&self) -> bool {
         match self {
@@ -153,6 +161,23 @@ impl TaskStateWrapper {
     }
 }
 
+/// Deserialize a concrete task-state payload from a queued task state
+pub fn decode_task_state<T>(state: &QueuedTaskState) -> Result<Option<T>, serde_json::Error>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    match state.execution_state() {
+        Some(serialized) => {
+            let wrapper: serde_json::Value = serde_json::from_str(serialized)?;
+            match wrapper.get("state") {
+                Some(inner) => serde_json::from_value(inner.clone()).map(Some),
+                None => Ok(None),
+            }
+        },
+        None => Ok(None),
+    }
+}
+
 impl Display for TaskStateWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -176,6 +201,55 @@ impl From<TaskStateWrapper> for QueuedTaskState {
         // Serialize the state into a string
         let description = value.to_string();
         let committed = value.committed();
-        QueuedTaskState::Running { state: description, committed }
+        let execution_state =
+            Some(serde_json::to_string(&value).expect("task state serialization should not fail"));
+        QueuedTaskState::Running { state: description, committed, execution_state }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::create_order::CreateOrderTaskState;
+
+    #[test]
+    fn test_running_state_roundtrips_execution_payload() {
+        let wrapper = TaskStateWrapper::CreateOrder(CreateOrderTaskState::Creating);
+        let queued_state: QueuedTaskState = wrapper.clone().into();
+
+        match &queued_state {
+            QueuedTaskState::Running { state, committed, execution_state } => {
+                assert_eq!(state, "Creating");
+                assert!(*committed);
+                assert!(execution_state.is_some());
+            },
+            other => panic!("expected running state, got {other:?}"),
+        }
+
+        let decoded_wrapper = TaskStateWrapper::from_queued_task_state(&queued_state)
+            .expect("queued task state should decode")
+            .expect("execution payload should be present");
+        assert!(matches!(decoded_wrapper, TaskStateWrapper::CreateOrder(CreateOrderTaskState::Creating)));
+
+        let decoded_concrete = decode_task_state::<CreateOrderTaskState>(&queued_state)
+            .expect("concrete task state should decode")
+            .expect("execution payload should be present");
+        assert_eq!(decoded_concrete, CreateOrderTaskState::Creating);
+    }
+
+    #[test]
+    fn test_missing_execution_payload_decodes_to_none() {
+        let queued_state = QueuedTaskState::Running {
+            state: "Pending".to_string(),
+            committed: false,
+            execution_state: None,
+        };
+
+        assert!(TaskStateWrapper::from_queued_task_state(&queued_state)
+            .expect("missing payload should not error")
+            .is_none());
+        assert!(decode_task_state::<CreateOrderTaskState>(&queued_state)
+            .expect("missing payload should not error")
+            .is_none());
     }
 }

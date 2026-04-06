@@ -9,7 +9,7 @@ use darkpool_types::{
     intent::{DarkpoolStateIntent, Intent},
     state_wrapper::StateWrapper,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::{State, error::StateError};
 use tracing::{info, instrument, warn};
 use types_account::{
@@ -45,7 +45,7 @@ const CREATE_ORDER_TASK_NAME: &str = "create-order";
 // --------------
 
 /// Represents the state of the task through its async execution
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CreateOrderTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -254,6 +254,7 @@ impl Task for CreateOrderTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 
     // Refresh the account after a failure
     fn failure_hooks(&self) -> Vec<Box<dyn TaskHook>> {

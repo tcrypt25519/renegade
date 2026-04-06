@@ -332,7 +332,11 @@ mod test {
         let waiter = state
             .transition_task(
                 task_id,
-                QueuedTaskState::Running { state: "Test".to_string(), committed: false },
+                QueuedTaskState::Running {
+                    state: "Test".to_string(),
+                    committed: false,
+                    execution_state: None,
+                },
             )
             .await
             .unwrap();
@@ -342,7 +346,11 @@ mod test {
         let task = state.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(
             task.state,
-            QueuedTaskState::Running { state: "Test".to_string(), committed: false }
+            QueuedTaskState::Running {
+                state: "Test".to_string(),
+                committed: false,
+                execution_state: None,
+            }
         );
     }
 

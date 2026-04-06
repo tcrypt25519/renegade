@@ -468,7 +468,11 @@ mod test {
 
         // Add two tasks to the queue, one running
         let mut task1 = mock_queued_task(key);
-        task1.state = QueuedTaskState::Running { state: "running".to_string(), committed: false };
+        task1.state = QueuedTaskState::Running {
+            state: "running".to_string(),
+            committed: false,
+            execution_state: None,
+        };
         let task2 = mock_queued_task(key);
         tx.enqueue_serial_task(&key, &task1)?;
         tx.enqueue_serial_task(&key, &task2)?;
@@ -538,7 +542,11 @@ mod test {
 
         // Add a serial task to the queue
         let mut task = mock_queued_task(key);
-        task.state = QueuedTaskState::Running { state: "running".to_string(), committed: false };
+        task.state = QueuedTaskState::Running {
+            state: "running".to_string(),
+            committed: false,
+            execution_state: None,
+        };
         tx.enqueue_serial_task(&key, &task)?;
 
         // Preempt the task queue
@@ -804,7 +812,11 @@ mod test {
 
         // Add a committed task to the queue
         let mut task = mock_queued_task(key);
-        task.state = QueuedTaskState::Running { state: "running".to_string(), committed: true };
+        task.state = QueuedTaskState::Running {
+            state: "running".to_string(),
+            committed: true,
+            execution_state: None,
+        };
         tx.enqueue_serial_task(&key, &task)?;
 
         // Attempt to preempt the task with another serial task

@@ -128,7 +128,7 @@ impl SchnorrPrivateKey {
 /// A Schnorr public key
 #[cfg_attr(feature = "proof-system-types", circuit_type(serde, singleprover_circuit, secret_share))]
 #[cfg_attr(not(feature = "proof-system-types"), circuit_type(serde))]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct SchnorrPublicKey {
     /// The curve point representing the public key
     pub point: BabyJubJubPoint,

@@ -11,7 +11,7 @@ use circuits_core::zk_circuits::valid_withdrawal::{
 use darkpool_types::withdrawal::Withdrawal;
 use job_types::proof_manager::{ProofJob, ProofManagerResponse};
 use renegade_solidity_abi::v2::IDarkpoolV2::WithdrawalAuth;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::{State, error::StateError};
 use tracing::{info, instrument};
 use types_account::{MerkleAuthenticationPath, balance::Balance};
@@ -36,7 +36,7 @@ const WITHDRAW_TASK_NAME: &str = "withdraw";
 // --------------
 
 /// Represents the state of the task through its async execution
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WithdrawTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -207,6 +207,7 @@ impl Task for WithdrawTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 
     fn failure_hooks(&self) -> Vec<Box<dyn TaskHook>> {
         vec![]

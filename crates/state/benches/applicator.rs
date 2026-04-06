@@ -81,7 +81,11 @@ fn bench_transition_task(c: &mut Criterion) {
 
     let transition = StateTransition::TransitionTask {
         task_id: task.id,
-        state: QueuedTaskState::Running { state: "dummy".to_string(), committed: false },
+        state: QueuedTaskState::Running {
+            state: "dummy".to_string(),
+            committed: false,
+            execution_state: None,
+        },
     };
 
     let mut group = c.benchmark_group("applicator");

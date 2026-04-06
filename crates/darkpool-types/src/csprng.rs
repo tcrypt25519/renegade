@@ -28,7 +28,7 @@ use {
 /// A CSPRNG's state
 #[cfg_attr(feature = "proof-system-types", circuit_type(serde, singleprover_circuit, secret_share))]
 #[cfg_attr(not(feature = "proof-system-types"), circuit_type(serde))]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "rkyv", derive(Archive, RkyvDeserialize, RkyvSerialize))]
 #[cfg_attr(feature = "rkyv", rkyv(derive(Debug)))]
 pub struct PoseidonCSPRNG {

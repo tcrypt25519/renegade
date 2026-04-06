@@ -10,7 +10,7 @@ use circuit_types::Amount;
 use darkpool_client::errors::DarkpoolClientError;
 use darkpool_types::bounded_match_result::BoundedMatchResult;
 use renegade_solidity_abi::v2::IDarkpoolV2::SettlementBundle;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::error::StateError;
 use system_bus::SystemBusMessage;
 use tracing::{info, instrument};
@@ -32,7 +32,7 @@ const SETTLE_EXTERNAL_MATCH_TASK_NAME: &str = "settle-external-match";
 // --------------
 
 /// Represents the state of the task through its async execution
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SettleExternalMatchTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -220,6 +220,7 @@ impl Task for SettleExternalMatchTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 
     /// External matches bypass the task queue to prevent raft contention
     fn bypass_task_queue(&self) -> bool {

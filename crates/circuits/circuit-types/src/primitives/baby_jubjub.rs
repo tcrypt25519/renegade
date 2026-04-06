@@ -31,7 +31,7 @@ use {
     circuit_type(serde, singleprover_circuit, secret_share, mpc, multiprover_circuit)
 )]
 #[cfg_attr(not(feature = "proof-system-types"), circuit_type(serde))]
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BabyJubJubPoint {
     /// The x coordinate of the point
     pub x: Scalar,

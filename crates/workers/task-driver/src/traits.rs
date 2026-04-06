@@ -45,6 +45,19 @@ pub trait Task: Send + Sized {
     /// A constructor for the task that takes a descriptor and a set of
     /// dependency injections
     async fn new(descriptor: Self::Descriptor, ctx: TaskContext) -> Result<Self, Self::Error>;
+    /// Construct a task from a descriptor and an optionally persisted task state
+    async fn restore(
+        descriptor: Self::Descriptor,
+        state: Option<Self::State>,
+        ctx: TaskContext,
+    ) -> Result<Self, Self::Error> {
+        let mut task = Self::new(descriptor, ctx).await?;
+        if let Some(state) = state {
+            task.restore_state(state);
+        }
+
+        Ok(task)
+    }
 
     // --- Task State --- //
 
@@ -56,6 +69,8 @@ pub trait Task: Send + Sized {
     }
     /// Get a displayable name for the task
     fn name(&self) -> String;
+    /// Restore the underlying task state from persisted queue state
+    fn restore_state(&mut self, _state: Self::State) {}
     /// Whether or not updates to this task should bypass the task queue
     ///
     /// Defined on this trait to allow maximally granular control over which
@@ -86,7 +101,7 @@ pub trait Task: Send + Sized {
 }
 
 /// A descriptor for a task, from which the task is constructable
-pub trait Descriptor: Debug + Serialize + for<'de> Deserialize<'de> {
+pub trait Descriptor: Debug + Send + Serialize + for<'de> Deserialize<'de> {
     /// Whether the task should bypass the task queue
     fn bypass_task_queue(&self) -> bool {
         false
@@ -96,7 +111,9 @@ pub trait Descriptor: Debug + Serialize + for<'de> Deserialize<'de> {
 /// The state of a task
 ///
 /// Must implement methods determining whether a task has completed or committed
-pub trait TaskState: Debug + Display + Ord + Send + Serialize + Into<TaskStateWrapper> {
+pub trait TaskState:
+    Debug + Display + Ord + Send + Serialize + for<'de> Deserialize<'de> + Into<TaskStateWrapper>
+{
     /// Whether or not the task is completed
     fn completed(&self) -> bool;
     /// The state in which the task may be considered (at least partially)

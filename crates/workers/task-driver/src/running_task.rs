@@ -45,8 +45,18 @@ impl<T: Task> RunnableTask<T> {
         descriptor: T::Descriptor,
         ctx: TaskContext,
     ) -> Result<Self, TaskDriverError> {
+        Self::restore(id, descriptor, None, ctx).await
+    }
+
+    /// Create a runnable from the given descriptor, restoring persisted task state
+    pub async fn restore(
+        id: TaskIdentifier,
+        descriptor: T::Descriptor,
+        restored_state: Option<T::State>,
+        ctx: TaskContext,
+    ) -> Result<Self, TaskDriverError> {
         let state = ctx.state.clone();
-        let task = T::new(descriptor, ctx).await?;
+        let task = T::restore(descriptor, restored_state, ctx).await?;
 
         Ok(Self::new(id, task, state))
     }
@@ -172,5 +182,181 @@ impl<T: Task> RunnableTask<T> {
         }
 
         Ok(is_running)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem;
+
+    use alloy::{primitives::Address, signers::local::PrivateKeySigner};
+    use async_trait::async_trait;
+    use darkpool_client::{DarkpoolClient, client::DarkpoolClientConfig};
+    use job_types::{
+        event_manager::new_event_manager_queue, matching_engine::new_matching_engine_worker_queue,
+        network_manager::new_network_manager_queue, proof_manager::new_proof_manager_queue,
+        task_driver::new_task_driver_queue,
+    };
+    use state::test_helpers::mock_state;
+    use system_bus::SystemBus;
+    use types_core::{Chain, HmacKey};
+    use url::Url;
+    use uuid::Uuid;
+
+    use crate::{
+        task_state::TaskStateWrapper,
+        traits::{Descriptor, TaskContext, TaskState},
+        utils::indexer_client::IndexerClient,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct DummyDescriptor;
+
+    impl Descriptor for DummyDescriptor {}
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+    enum DummyState {
+        Pending,
+        Running,
+        Completed,
+    }
+
+    impl std::fmt::Display for DummyState {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Pending => write!(f, "Pending"),
+                Self::Running => write!(f, "Running"),
+                Self::Completed => write!(f, "Completed"),
+            }
+        }
+    }
+
+    impl TaskState for DummyState {
+        fn completed(&self) -> bool {
+            matches!(self, Self::Completed)
+        }
+
+        fn commit_point() -> Self {
+            Self::Running
+        }
+    }
+
+    impl From<DummyState> for TaskStateWrapper {
+        fn from(value: DummyState) -> Self {
+            TaskStateWrapper::NodeStartup(match value {
+                DummyState::Pending => crate::tasks::node_startup::NodeStartupTaskState::Pending,
+                DummyState::Running => {
+                    crate::tasks::node_startup::NodeStartupTaskState::RunningStateMigrations
+                },
+                DummyState::Completed => crate::tasks::node_startup::NodeStartupTaskState::Completed,
+            })
+        }
+    }
+
+    struct DummyTask {
+        state: DummyState,
+    }
+
+    #[async_trait]
+    impl Task for DummyTask {
+        type Descriptor = DummyDescriptor;
+        type State = DummyState;
+        type Error = DummyError;
+
+        async fn new(_descriptor: Self::Descriptor, _ctx: TaskContext) -> Result<Self, Self::Error> {
+            Ok(Self { state: DummyState::Pending })
+        }
+
+        fn task_state(&self) -> Self::State {
+            self.state.clone()
+        }
+
+        fn name(&self) -> String {
+            "dummy-task".to_string()
+        }
+
+        fn restore_state(&mut self, state: Self::State) {
+            self.state = state;
+        }
+
+        async fn step(&mut self) -> Result<(), Self::Error> {
+            self.state = DummyState::Completed;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DummyError;
+
+    impl std::fmt::Display for DummyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dummy error")
+        }
+    }
+
+    impl TaskError for DummyError {
+        fn retryable(&self) -> bool {
+            false
+        }
+    }
+
+    async fn mock_task_context() -> TaskContext {
+        let state = mock_state().await;
+        let darkpool_client = DarkpoolClient::new(DarkpoolClientConfig {
+            darkpool_addr: Address::ZERO,
+            permit2_addr: Address::ZERO,
+            chain: Chain::ArbitrumSepolia,
+            rpc_url: "http://localhost:8545".to_string(),
+            private_key: PrivateKeySigner::random(),
+            block_polling_interval: std::time::Duration::from_secs(1),
+        })
+        .expect("darkpool client config should be constructable");
+        let (network_queue, network_recv) = new_network_manager_queue();
+        let (proof_queue, proof_recv) = new_proof_manager_queue();
+        let (event_queue, event_recv) = new_event_manager_queue();
+        let (matching_engine_queue, matching_engine_recv) = new_matching_engine_worker_queue();
+        let (task_queue, task_recv) = new_task_driver_queue();
+        mem::forget(network_recv);
+        mem::forget(proof_recv);
+        mem::forget(event_recv);
+        mem::forget(matching_engine_recv);
+        mem::forget(task_recv);
+
+        TaskContext {
+            darkpool_client,
+            state,
+            network_queue,
+            proof_queue,
+            event_queue,
+            matching_engine_queue,
+            task_queue,
+            bus: SystemBus::new(),
+            indexer_client: IndexerClient::new(
+                Url::parse("http://localhost:3000").unwrap(),
+                HmacKey([0u8; 32]),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_uses_persisted_task_state() {
+        let ctx = mock_task_context().await;
+        let runnable = RunnableTask::<DummyTask>::restore(
+            Uuid::new_v4(),
+            DummyDescriptor,
+            Some(DummyState::Running),
+            ctx,
+        )
+        .await
+        .expect("task restore should succeed");
+
+        assert!(matches!(
+            runnable.state(),
+            TaskStateWrapper::NodeStartup(
+                crate::tasks::node_startup::NodeStartupTaskState::RunningStateMigrations
+            )
+        ));
     }
 }

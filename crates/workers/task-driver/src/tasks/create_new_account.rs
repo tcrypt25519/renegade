@@ -8,7 +8,7 @@ use std::{
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use renegade_metrics::labels::NUM_NEW_WALLETS_METRIC;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::error::StateError;
 use tracing::{instrument, warn};
 use types_account::{Account, keychain::KeyChain};
@@ -29,7 +29,7 @@ const CREATE_NEW_ACCOUNT_TASK_NAME: &str = "create-new-account";
 // --------------
 
 /// Represents the state of the task through its async execution
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CreateNewAccountTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -160,6 +160,7 @@ impl Task for CreateNewAccountTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 }
 
 impl Descriptor for NewAccountTaskDescriptor {}

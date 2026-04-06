@@ -42,7 +42,11 @@ fn task_not_running(task_id: TaskIdentifier) -> String {
 
 /// Construct the running state for a newly started task
 fn new_running_state() -> QueuedTaskState {
-    QueuedTaskState::Running { state: PENDING_STATE.to_string(), committed: false }
+    QueuedTaskState::Running {
+        state: PENDING_STATE.to_string(),
+        committed: false,
+        execution_state: None,
+    }
 }
 
 /// Convert a QueuedTask to a TaskStatus for system bus messages
@@ -706,7 +710,11 @@ mod test {
         applicator.append_task(&task, &my_peer_id /* executor */)?;
 
         // Transition the state of the top task in the queue
-        let new_state = QueuedTaskState::Running { state: "Test".to_string(), committed: false };
+        let new_state = QueuedTaskState::Running {
+            state: "Test".to_string(),
+            committed: false,
+            execution_state: None,
+        };
         applicator.transition_task_state(task.id, new_state)?;
 
         // Ensure the task state was updated
@@ -716,7 +724,8 @@ mod test {
 
         assert!(matches!(
             task_info.state,
-            QueuedTaskState::Running { state, committed: false } if state == "Test"
+            QueuedTaskState::Running { state, committed: false, execution_state: None }
+                if state == "Test"
         ));
         Ok(())
     }
@@ -744,7 +753,11 @@ mod test {
         )?;
 
         // Try to transition the state of the task
-        let new_state = QueuedTaskState::Running { state: "Test".to_string(), committed: false };
+        let new_state = QueuedTaskState::Running {
+            state: "Test".to_string(),
+            committed: false,
+            execution_state: None,
+        };
         let err = applicator.transition_task_state(task.id, new_state.clone()).unwrap_err();
         assert!(matches!(err, StateApplicatorError::Rejected(_)));
         Ok(())

@@ -10,7 +10,7 @@ use ark_mpc::{PARTY0, PARTY1, network::PartyId};
 use async_trait::async_trait;
 use darkpool_client::errors::DarkpoolClientError;
 use darkpool_types::settlement_obligation::SettlementObligation;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::error::StateError;
 use tracing::instrument;
 use types_account::OrderId;
@@ -40,7 +40,7 @@ const SETTLE_PRIVATE_MATCH_TASK_NAME: &str = "settle-private-match";
 // --------------
 
 /// Represents the state of the private match settlement task
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SettlePrivateMatchTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -241,6 +241,7 @@ impl Task for SettlePrivateMatchTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 
     // Re-run the matching engine on both orders for recursive fills
     fn success_hooks(&self) -> Vec<Box<dyn TaskHook>> {

@@ -19,6 +19,9 @@ pub enum TaskDriverError {
     /// An error querying global state
     #[error("state error: {0}")]
     State(String),
+    /// An error decoding persisted task state
+    #[error("task state decode error: {0}")]
+    TaskStateDecode(String),
     /// An error running a task
     #[error("task error: {0}")]
     TaskError(String),

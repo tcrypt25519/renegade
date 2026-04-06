@@ -15,6 +15,7 @@ use crypto::hash::compute_poseidon_hash;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+use std::cmp::Ordering;
 use std::fmt::Debug;
 
 use circuit_macros::circuit_type;
@@ -64,6 +65,44 @@ where
     pub inner: T,
     /// The public shares of the state element
     pub public_share: T::ShareType,
+}
+
+impl<T> PartialOrd for StateWrapper<T>
+where
+    T: StateWrapperBound + PartialOrd,
+    T::ShareType: StateWrapperShareBound + PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match PartialOrd::partial_cmp(&self.recovery_stream, &other.recovery_stream) {
+            Some(Ordering::Equal) => {},
+            Some(other) => return Some(other),
+            None => return None,
+        }
+        match PartialOrd::partial_cmp(&self.share_stream, &other.share_stream) {
+            Some(Ordering::Equal) => {},
+            Some(other) => return Some(other),
+            None => return None,
+        }
+        match self.inner.partial_cmp(&other.inner) {
+            Some(Ordering::Equal) => {},
+            Some(other) => return Some(other),
+            None => return None,
+        }
+        self.public_share.partial_cmp(&other.public_share)
+    }
+}
+
+impl<T> Ord for StateWrapper<T>
+where
+    T: StateWrapperBound + Ord,
+    T::ShareType: StateWrapperShareBound + Ord,
+{
+    fn cmp(&self, other: &Self) -> Ordering {
+        Ord::cmp(&self.recovery_stream, &other.recovery_stream)
+            .then_with(|| Ord::cmp(&self.share_stream, &other.share_stream))
+            .then_with(|| self.inner.cmp(&other.inner))
+            .then_with(|| self.public_share.cmp(&other.public_share))
+    }
 }
 
 impl<T> StateWrapper<T>

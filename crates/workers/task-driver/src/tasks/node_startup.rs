@@ -15,7 +15,7 @@ use job_types::{
     proof_manager::ProofManagerQueue,
     task_driver::TaskDriverQueue,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::{State, error::StateError};
 use tracing::{info, instrument};
 use types_core::{AccountId, Token, get_all_tokens};
@@ -38,7 +38,7 @@ const NODE_STARTUP_TASK_NAME: &str = "node-startup";
 const ERR_SEND_JOB: &str = "error sending job";
 
 /// Defines the state of the node startup task
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NodeStartupTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -238,6 +238,7 @@ impl Task for NodeStartupTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 
     fn name(&self) -> String {
         NODE_STARTUP_TASK_NAME.to_string()

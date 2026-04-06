@@ -1,6 +1,7 @@
 //! Defines a task to settle an internal match
 
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::cmp::Ordering;
 
 use alloy::rpc::types::TransactionReceipt;
 use ark_mpc::{PARTY0, PARTY1, network::PartyId};
@@ -8,7 +9,7 @@ use async_trait::async_trait;
 use darkpool_client::errors::DarkpoolClientError;
 use darkpool_types::settlement_obligation::SettlementObligation;
 use renegade_metrics::record_match_volume;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::error::StateError;
 use tracing::instrument;
 use types_account::OrderId;
@@ -39,7 +40,7 @@ const SETTLE_INTERNAL_MATCH_TASK_NAME: &str = "settle-internal-match";
 // --------------
 
 /// Represents the state of the task through its async execution
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SettleInternalMatchTaskState {
     /// The task is awaiting scheduling
     Pending,
@@ -47,11 +48,49 @@ pub enum SettleInternalMatchTaskState {
     SubmittingTx,
     /// The task is updating the account state for the parties involved in the
     /// match
-    UpdatingState,
+    UpdatingState {
+        /// The initiating order after settlement-derived intent updates
+        updated_order0: Order,
+        /// The counterparty order after settlement-derived intent updates
+        updated_order1: Order,
+        /// The updated input balance for party 0 (Ring 2+ only)
+        updated_input_balance0: Option<Balance>,
+        /// The updated input balance for party 1 (Ring 2+ only)
+        updated_input_balance1: Option<Balance>,
+        /// The updated output balance for party 0 (Ring 2+ only)
+        updated_output_balance0: Option<Balance>,
+        /// The updated output balance for party 1 (Ring 2+ only)
+        updated_output_balance1: Option<Balance>,
+    },
     /// The task is regenerating validity proofs for private (Ring 1+) orders
     UpdatingValidityProofs,
     /// The task is completed
     Completed,
+}
+
+impl SettleInternalMatchTaskState {
+    /// Return the execution phase ordering for the task state.
+    fn phase(&self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::SubmittingTx => 1,
+            Self::UpdatingState { .. } => 2,
+            Self::UpdatingValidityProofs => 3,
+            Self::Completed => 4,
+        }
+    }
+}
+
+impl PartialOrd for SettleInternalMatchTaskState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SettleInternalMatchTaskState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.phase().cmp(&other.phase())
+    }
 }
 
 impl TaskState for SettleInternalMatchTaskState {
@@ -69,7 +108,7 @@ impl Display for SettleInternalMatchTaskState {
         match self {
             SettleInternalMatchTaskState::Pending => write!(f, "Pending"),
             SettleInternalMatchTaskState::SubmittingTx => write!(f, "SubmittingTx"),
-            SettleInternalMatchTaskState::UpdatingState => write!(f, "UpdatingState"),
+            SettleInternalMatchTaskState::UpdatingState { .. } => write!(f, "UpdatingState"),
             SettleInternalMatchTaskState::UpdatingValidityProofs => {
                 write!(f, "UpdatingValidityProofs")
             },
@@ -208,16 +247,41 @@ impl Task for SettleInternalMatchTask {
     #[instrument(skip_all, err, fields(task = %self.name(), state = %self.task_state()))]
     async fn step(&mut self) -> Result<()> {
         // Dispatch based on task state
-        match self.task_state {
+        match self.task_state.clone() {
             SettleInternalMatchTaskState::Pending => {
                 self.task_state = SettleInternalMatchTaskState::SubmittingTx;
             },
             SettleInternalMatchTaskState::SubmittingTx => {
                 self.submit_tx().await?;
-                self.task_state = SettleInternalMatchTaskState::UpdatingState;
+
+                // After `submit_tx` the `updated_...` fields are populated on `self`
+                // Transition to `UpdatingState` with this info to persist it
+                self.task_state = SettleInternalMatchTaskState::UpdatingState {
+                    updated_order0: self.updated_order0.clone().unwrap(),
+                    updated_order1: self.updated_order1.clone().unwrap(),
+                    updated_input_balance0: self.updated_input_balance0.clone(),
+                    updated_input_balance1: self.updated_input_balance1.clone(),
+                    updated_output_balance0: self.updated_output_balance0.clone(),
+                    updated_output_balance1: self.updated_output_balance1.clone(),
+                };
             },
-            SettleInternalMatchTaskState::UpdatingState => {
-                self.update_state().await?;
+            SettleInternalMatchTaskState::UpdatingState {
+                updated_order0,
+                updated_order1,
+                updated_input_balance0,
+                updated_input_balance1,
+                updated_output_balance0,
+                updated_output_balance1,
+            } => {
+                self.update_state(
+                    updated_order0,
+                    updated_order1,
+                    updated_input_balance0,
+                    updated_input_balance1,
+                    updated_output_balance0,
+                    updated_output_balance1,
+                )
+                .await?;
                 self.task_state = SettleInternalMatchTaskState::UpdatingValidityProofs;
             },
             SettleInternalMatchTaskState::UpdatingValidityProofs => {
@@ -244,6 +308,7 @@ impl Task for SettleInternalMatchTask {
     fn task_state(&self) -> Self::State {
         self.task_state.clone()
     }
+
 
     // Re-run the matching engine on both orders for recursive fills
     fn success_hooks(&self) -> Vec<Box<dyn TaskHook>> {
@@ -377,22 +442,44 @@ impl SettleInternalMatchTask {
     /// For Ring 2 orders the pre-computed darkpool input and output balances
     /// are written to state. For Ring 0/1 orders only the EOA input balance
     /// amount is decremented.
-    async fn update_state(&self) -> Result<()> {
-        let party0_fut = self.update_state_for_party(PARTY0);
-        let party1_fut = self.update_state_for_party(PARTY1);
+    async fn update_state(
+        &self,
+        updated_order0: Order,
+        updated_order1: Order,
+        updated_input_balance0: Option<Balance>,
+        updated_input_balance1: Option<Balance>,
+        updated_output_balance0: Option<Balance>,
+        updated_output_balance1: Option<Balance>,
+    ) -> Result<()> {
+        let party0_fut = self.update_state_for_party(
+            PARTY0,
+            updated_order0,
+            updated_input_balance0,
+            updated_output_balance0,
+        );
+        let party1_fut = self.update_state_for_party(
+            PARTY1,
+            updated_order1,
+            updated_input_balance1,
+            updated_output_balance1,
+        );
         tokio::try_join!(party0_fut, party1_fut)?;
         Ok(())
     }
 
     /// Update the state for a given party
-    async fn update_state_for_party(&self, party_id: PartyId) -> Result<()> {
+    async fn update_state_for_party(
+        &self,
+        party_id: PartyId,
+        order: Order,
+        input_balance: Option<Balance>,
+        output_balance: Option<Balance>,
+    ) -> Result<()> {
         let account_id = branch_party!(party_id, self.account_id, self.other_account_id);
         let obligation = self.get_obligation(party_id)?;
-        let order =
-            branch_party!(party_id, &self.updated_order0, &self.updated_order1).clone().unwrap();
 
         // Update the balances for the party
-        let updated_balances = self.get_updated_balances(party_id);
+        let updated_balances = input_balance.zip(output_balance);
         self.processor
             .update_balances_after_match(account_id, &order, obligation, updated_balances)
             .await?;
@@ -466,20 +553,6 @@ impl SettleInternalMatchTask {
 // -----------
 
 impl SettleInternalMatchTask {
-    /// Get the pre-computed updated balances for a party, if any
-    ///
-    /// Returns `Some((input, output))` for Ring 2 parties whose balances
-    /// were pre-computed, or `None` for Ring 0/1 parties.
-    fn get_updated_balances(&self, party_id: PartyId) -> Option<(Balance, Balance)> {
-        let input =
-            branch_party!(party_id, &self.updated_input_balance0, &self.updated_input_balance1)
-                .clone();
-        let output =
-            branch_party!(party_id, &self.updated_output_balance0, &self.updated_output_balance1)
-                .clone();
-        input.zip(output)
-    }
-
     /// Get the obligation for a given party
     fn get_obligation(&self, party_id: PartyId) -> Result<&SettlementObligation> {
         let obligation = branch_party!(
