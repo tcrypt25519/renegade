@@ -38,6 +38,20 @@ pub struct Proposal {
     pub transition: Box<StateTransition>,
 }
 
+/// The durable state update for one party in a matched settlement
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+#[rkyv(derive(Debug))]
+pub struct MatchSettlementParty {
+    /// The account whose state is being updated
+    pub account_id: AccountId,
+    /// The post-settlement order state for the party
+    pub order: Order,
+    /// The post-settlement balances for the party
+    pub balances: Vec<Balance>,
+}
+
 /// The `StateTransitionType` encapsulates all possible state transitions,
 /// allowing transitions to be handled generically before they are applied
 #[derive(Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -55,6 +69,8 @@ pub enum StateTransition {
     UpdateOrder { order: Order },
     /// Update a balance in an account
     UpdateAccountBalance { account_id: AccountId, balance: Balance },
+    /// Apply the durable post-settlement state update for a matched pair atomically
+    ApplyMatchSettlement { party0: MatchSettlementParty, party1: MatchSettlementParty },
     /// Update an account's keychain
     UpdateAccountKeychain { account_id: AccountId, keychain: KeyChain },
     /// Refresh an account's state

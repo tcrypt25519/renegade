@@ -23,6 +23,7 @@ use types_proofs::ValidityProofLocator;
 
 use crate::{
     applicator::error::StateApplicatorError,
+    state_transition::MatchSettlementParty,
     storage::{traits::RkyvValue, tx::StateTxn},
 };
 
@@ -248,6 +249,34 @@ impl StateApplicator {
         Ok(ApplicatorReturnType::None)
     }
 
+    /// Apply a matched settlement to both parties atomically
+    pub fn apply_match_settlement(
+        &self,
+        party0: &MatchSettlementParty,
+        party1: &MatchSettlementParty,
+    ) -> Result<ApplicatorReturnType> {
+        Self::validate_match_settlement_parties([party0, party1])?;
+
+        let tx = self.db().new_write_tx()?;
+        self.validate_match_settlement_party(&tx, party0)?;
+        self.validate_match_settlement_party(&tx, party1)?;
+
+        for party in [party0, party1] {
+            for balance in &party.balances {
+                tx.update_balance(&party.account_id, balance)?;
+            }
+
+            tx.update_order(&party.account_id, &party.order)?;
+        }
+        tx.commit()?;
+
+        let tx = self.db().new_read_tx()?;
+        self.publish_match_settlement_balance_updates([party0, party1], &tx)?;
+        self.publish_match_settlement_order_updates([party0, party1], &tx)?;
+
+        Ok(ApplicatorReturnType::None)
+    }
+
     /// Update an account's keychain
     pub fn update_account_keychain(
         &self,
@@ -395,6 +424,106 @@ impl StateApplicator {
             SystemBusMessage::OwnerIndexChanged { owner, added },
         );
     }
+
+    /// Validate the settlement payload before touching storage
+    fn validate_match_settlement_parties(parties: [&MatchSettlementParty; 2]) -> Result<()> {
+        let mut seen = Vec::new();
+        for party in parties {
+            for balance in &party.balances {
+                let key = (party.account_id, balance.mint(), balance.location);
+                if seen.contains(&key) {
+                    return Err(StateApplicatorError::reject(
+                        "duplicate settlement balance update",
+                    ));
+                }
+                seen.push(key);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a single settlement party against current state
+    fn validate_match_settlement_party(
+        &self,
+        tx: &StateTxn<'_, libmdbx::RW>,
+        party: &MatchSettlementParty,
+    ) -> Result<()> {
+        if !tx.contains_account(&party.account_id)? {
+            return Err(StateApplicatorError::reject("account not found"));
+        }
+
+        let order_id = party.order.id;
+        if tx.get_order(&order_id)?.is_none() {
+            return Err(StateApplicatorError::reject(format!("order {order_id} not found")));
+        }
+
+        let stored_account_id = tx
+            .get_account_id_for_order(&order_id)?
+            .ok_or_else(|| StateApplicatorError::reject("order not associated with account"))?;
+        if stored_account_id != party.account_id {
+            return Err(StateApplicatorError::reject(
+                "settlement order does not belong to the provided account",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Recompute matching-engine state and publish balance events after
+    /// settlement commit
+    fn publish_match_settlement_balance_updates<T: libmdbx::TransactionKind>(
+        &self,
+        parties: [&MatchSettlementParty; 2],
+        tx: &StateTxn<'_, T>,
+    ) -> Result<()> {
+        let engine = self.matching_engine();
+        let mut seen = Vec::new();
+
+        for party in parties {
+            for balance in &party.balances {
+                let key = (party.account_id, balance.mint(), balance.location);
+                if seen.contains(&key) {
+                    continue;
+                }
+
+                update_matchable_amounts(party.account_id, balance, &engine, tx)?;
+                self.publish_admin_balance_update(party.account_id, balance);
+                seen.push(key);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update the settled orders in the matching engine after settlement commit
+    fn publish_match_settlement_order_updates<T: libmdbx::TransactionKind>(
+        &self,
+        parties: [&MatchSettlementParty; 2],
+        tx: &StateTxn<'_, T>,
+    ) -> Result<()> {
+        let engine = self.matching_engine();
+
+        for party in parties {
+            let order_id = party.order.id;
+            let pool = tx.get_matching_pool_for_order(&order_id)?;
+            let matchable_amount = tx.get_order_matchable_amount(&order_id)?.unwrap_or_default();
+            if matchable_amount > 0 {
+                engine.upsert_order(party.account_id, &party.order, matchable_amount, pool.clone());
+            } else {
+                engine.cancel_order(&party.order, pool.clone());
+            }
+
+            self.publish_admin_order_update(
+                party.account_id,
+                &party.order,
+                pool,
+                AdminOrderUpdateType::Updated,
+            );
+        }
+
+        Ok(())
+    }
 }
 
 // ---------
@@ -417,7 +546,9 @@ pub(crate) mod test {
         IntentOnlyValidityBundle, ValidityProofLocator, mocks::mock_intent_only_validity_bundle,
     };
 
-    use crate::applicator::test_helpers::mock_applicator;
+    use crate::{
+        applicator::test_helpers::mock_applicator, state_transition::MatchSettlementParty,
+    };
 
     /// Tests adding a new account to the index
     #[test]
@@ -658,6 +789,135 @@ pub(crate) mod test {
         assert!(matching_engine.contains_order(&order1, matching_pool1));
         assert!(matching_engine.contains_order(&order2, matching_pool2));
         assert!(!matching_engine.contains_order(&order3, matching_pool3));
+    }
+
+    /// Test atomically applying a matched settlement across both parties
+    #[test]
+    fn test_apply_match_settlement() {
+        let applicator = mock_applicator();
+        let matching_engine = applicator.matching_engine().clone();
+
+        let account0 = mock_empty_account();
+        let account1 = mock_empty_account();
+        applicator.create_account(&account0).unwrap();
+        applicator.create_account(&account1).unwrap();
+
+        let auth0 = mock_order_auth();
+        let auth1 = mock_order_auth();
+        let order0 = mock_order();
+        let order1 = mock_order();
+        applicator
+            .add_order_to_account(account0.id, &order0, &auth0, GLOBAL_MATCHING_POOL.to_string())
+            .unwrap();
+        applicator
+            .add_order_to_account(account1.id, &order1, &auth1, GLOBAL_MATCHING_POOL.to_string())
+            .unwrap();
+
+        let mut updated_order0 = order0.clone();
+        updated_order0.decrement_amount_in(1);
+        let mut updated_order1 = order1.clone();
+        updated_order1.decrement_amount_in(2);
+
+        let mut balance0 = mock_balance();
+        *balance0.amount_mut() = 111;
+        let mut balance1 = mock_balance();
+        *balance1.amount_mut() = 222;
+
+        let party0 = MatchSettlementParty {
+            account_id: account0.id,
+            order: updated_order0.clone(),
+            balances: vec![balance0.clone()],
+        };
+        let party1 = MatchSettlementParty {
+            account_id: account1.id,
+            order: updated_order1.clone(),
+            balances: vec![balance1.clone()],
+        };
+
+        applicator.apply_match_settlement(&party0, &party1).unwrap();
+
+        let tx = applicator.db().new_read_tx().unwrap();
+        let retrieved_order0 = tx.get_order(&order0.id).unwrap().unwrap().deserialize().unwrap();
+        let retrieved_order1 = tx.get_order(&order1.id).unwrap().unwrap().deserialize().unwrap();
+        assert_eq!(retrieved_order0.amount_in(), updated_order0.amount_in());
+        assert_eq!(retrieved_order1.amount_in(), updated_order1.amount_in());
+
+        let retrieved_balance0 = tx
+            .get_balance(&account0.id, &balance0.mint(), balance0.location)
+            .unwrap()
+            .unwrap()
+            .deserialize()
+            .unwrap();
+        let retrieved_balance1 = tx
+            .get_balance(&account1.id, &balance1.mint(), balance1.location)
+            .unwrap()
+            .unwrap()
+            .deserialize()
+            .unwrap();
+        assert_eq!(retrieved_balance0.amount(), balance0.amount());
+        assert_eq!(retrieved_balance1.amount(), balance1.amount());
+
+        let pool0 = tx.get_matching_pool_for_order(&order0.id).unwrap();
+        let pool1 = tx.get_matching_pool_for_order(&order1.id).unwrap();
+        let matchable0 = tx.get_order_matchable_amount(&order0.id).unwrap().unwrap();
+        let matchable1 = tx.get_order_matchable_amount(&order1.id).unwrap().unwrap();
+        drop(tx);
+
+        assert_eq!(
+            matching_engine.get_matchable_amount(&updated_order0, pool0.clone()),
+            (matchable0 > 0).then_some(matchable0)
+        );
+        assert_eq!(
+            matching_engine.get_matchable_amount(&updated_order1, pool1.clone()),
+            (matchable1 > 0).then_some(matchable1)
+        );
+    }
+
+    /// Test rejecting a settlement payload with duplicate balance keys
+    #[test]
+    fn test_apply_match_settlement_rejects_duplicate_balance_keys() {
+        let applicator = mock_applicator();
+
+        let account0 = mock_empty_account();
+        let account1 = mock_empty_account();
+        applicator.create_account(&account0).unwrap();
+        applicator.create_account(&account1).unwrap();
+
+        let auth0 = mock_order_auth();
+        let auth1 = mock_order_auth();
+        let order0 = mock_order();
+        let order1 = mock_order();
+        applicator
+            .add_order_to_account(account0.id, &order0, &auth0, GLOBAL_MATCHING_POOL.to_string())
+            .unwrap();
+        applicator
+            .add_order_to_account(account1.id, &order1, &auth1, GLOBAL_MATCHING_POOL.to_string())
+            .unwrap();
+
+        let mut duplicate_balance = mock_balance();
+        *duplicate_balance.amount_mut() = 50;
+        let mut other_duplicate = duplicate_balance.clone();
+        *other_duplicate.amount_mut() = 75;
+
+        let party0 = MatchSettlementParty {
+            account_id: account0.id,
+            order: order0.clone(),
+            balances: vec![duplicate_balance.clone()],
+        };
+        let party1 = MatchSettlementParty {
+            account_id: account0.id,
+            order: order1.clone(),
+            balances: vec![other_duplicate],
+        };
+
+        let err = applicator.apply_match_settlement(&party0, &party1).unwrap_err();
+        assert!(err.to_string().contains("duplicate settlement balance update"));
+
+        let tx = applicator.db().new_read_tx().unwrap();
+        let stored_balance = tx
+            .get_balance(&account0.id, &duplicate_balance.mint(), duplicate_balance.location)
+            .unwrap();
+        assert!(stored_balance.is_none());
     }
 
     // --- Owner Index Cleanup Tests ---

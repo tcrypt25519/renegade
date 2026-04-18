@@ -17,8 +17,12 @@ use types_core::{AccountId, HmacKey};
 use util::res_some;
 
 use crate::{
-    StateInner, applicator::account_index::update_matchable_amounts, error::StateError,
-    notifications::ProposalWaiter, state_transition::StateTransition, storage::traits::RkyvValue,
+    StateInner,
+    applicator::account_index::update_matchable_amounts,
+    error::StateError,
+    notifications::ProposalWaiter,
+    state_transition::{MatchSettlementParty, StateTransition},
+    storage::traits::RkyvValue,
 };
 
 impl StateInner {
@@ -434,6 +438,15 @@ impl StateInner {
         self.send_proposal(StateTransition::UpdateAccountBalance { account_id, balance }).await
     }
 
+    /// Apply a matched settlement to both parties atomically
+    pub async fn apply_match_settlement(
+        &self,
+        party0: MatchSettlementParty,
+        party1: MatchSettlementParty,
+    ) -> Result<ProposalWaiter, StateError> {
+        self.send_proposal(StateTransition::ApplyMatchSettlement { party0, party1 }).await
+    }
+
     /// Update an account's keychain
     pub async fn update_account_keychain(
         &self,
@@ -479,11 +492,11 @@ impl StateInner {
 mod test {
     use constants::GLOBAL_MATCHING_POOL;
     use types_account::{
-        account::mocks::mock_empty_account, order::mocks::mock_order,
+        account::mocks::mock_empty_account, balance::mocks::mock_balance, order::mocks::mock_order,
         order_auth::mocks::mock_order_auth,
     };
 
-    use crate::test_helpers::mock_state;
+    use crate::{state_transition::MatchSettlementParty, test_helpers::mock_state};
 
     /// Test creating an account
     #[tokio::test]
@@ -550,5 +563,84 @@ mod test {
         // Verify the order was removed
         let retrieved_account = state.get_account(&account.id).await.unwrap().unwrap();
         assert!(!retrieved_account.orders.contains_key(&order.id));
+    }
+
+    /// Test atomically applying a matched settlement across two parties
+    #[tokio::test]
+    async fn test_apply_match_settlement() {
+        let state = mock_state().await;
+
+        let account0 = mock_empty_account();
+        let account1 = mock_empty_account();
+        state.new_account(account0.clone()).await.unwrap().await.unwrap();
+        state.new_account(account1.clone()).await.unwrap().await.unwrap();
+
+        let auth0 = mock_order_auth();
+        let auth1 = mock_order_auth();
+        let order0 = mock_order();
+        let order1 = mock_order();
+        state
+            .add_order_to_account(
+                account0.id,
+                order0.clone(),
+                auth0,
+                GLOBAL_MATCHING_POOL.to_string(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        state
+            .add_order_to_account(
+                account1.id,
+                order1.clone(),
+                auth1,
+                GLOBAL_MATCHING_POOL.to_string(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mut updated_order0 = order0.clone();
+        updated_order0.decrement_amount_in(1);
+        let mut updated_order1 = order1.clone();
+        updated_order1.decrement_amount_in(2);
+
+        let mut balance0 = mock_balance();
+        *balance0.amount_mut() = 111;
+        let mut balance1 = mock_balance();
+        *balance1.amount_mut() = 222;
+
+        let party0 = MatchSettlementParty {
+            account_id: account0.id,
+            order: updated_order0.clone(),
+            balances: vec![balance0.clone()],
+        };
+        let party1 = MatchSettlementParty {
+            account_id: account1.id,
+            order: updated_order1.clone(),
+            balances: vec![balance1.clone()],
+        };
+
+        state.apply_match_settlement(party0, party1).await.unwrap().await.unwrap();
+
+        let retrieved_order0 = state.get_account_order(&order0.id).await.unwrap().unwrap();
+        let retrieved_order1 = state.get_account_order(&order1.id).await.unwrap().unwrap();
+        assert_eq!(retrieved_order0.amount_in(), updated_order0.amount_in());
+        assert_eq!(retrieved_order1.amount_in(), updated_order1.amount_in());
+
+        let retrieved_balance0 = state
+            .get_account_balance(&account0.id, &balance0.mint(), balance0.location)
+            .await
+            .unwrap()
+            .unwrap();
+        let retrieved_balance1 = state
+            .get_account_balance(&account1.id, &balance1.mint(), balance1.location)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved_balance0.amount(), balance0.amount());
+        assert_eq!(retrieved_balance1.amount(), balance1.amount());
     }
 }

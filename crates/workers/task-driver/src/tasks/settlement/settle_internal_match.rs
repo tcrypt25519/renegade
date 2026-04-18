@@ -378,27 +378,16 @@ impl SettleInternalMatchTask {
     /// are written to state. For Ring 0/1 orders only the EOA input balance
     /// amount is decremented.
     async fn update_state(&self) -> Result<()> {
-        let party0_fut = self.update_state_for_party(PARTY0);
-        let party1_fut = self.update_state_for_party(PARTY1);
-        tokio::try_join!(party0_fut, party1_fut)?;
-        Ok(())
-    }
-
-    /// Update the state for a given party
-    async fn update_state_for_party(&self, party_id: PartyId) -> Result<()> {
-        let account_id = branch_party!(party_id, self.account_id, self.other_account_id);
-        let obligation = self.get_obligation(party_id)?;
-        let order =
-            branch_party!(party_id, &self.updated_order0, &self.updated_order1).clone().unwrap();
-
-        // Update the balances for the party
-        let updated_balances = self.get_updated_balances(party_id);
         self.processor
-            .update_balances_after_match(account_id, &order, obligation, updated_balances)
+            .apply_match_settlement(
+                self.account_id,
+                self.updated_order0.clone().unwrap(),
+                self.get_updated_balances(PARTY0),
+                self.other_account_id,
+                self.updated_order1.clone().unwrap(),
+                self.get_updated_balances(PARTY1),
+            )
             .await?;
-
-        // Update the order after settlement
-        self.processor.update_order_after_match(order).await?;
         Ok(())
     }
 

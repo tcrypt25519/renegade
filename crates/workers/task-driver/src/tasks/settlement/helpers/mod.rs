@@ -6,6 +6,7 @@ use alloy::{
 use circuit_types::{fixed_point::FixedPoint, schnorr::SchnorrSignature};
 use darkpool_types::{fee::FeeRates, settlement_obligation::SettlementObligation};
 use renegade_solidity_abi::v2::IDarkpoolV2::{FeeRate, PublicIntentPermit, SignatureWithNonce};
+use state::state_transition::MatchSettlementParty;
 use types_account::{
     OrderId,
     balance::{Balance, BalanceLocation},
@@ -187,17 +188,6 @@ impl SettlementProcessor {
         Ok(order)
     }
 
-    /// Update an order's state after a match settlement
-    ///
-    /// For Ring 0, this just decrements the amount remaining. For Ring 1+, this
-    /// also updates the streams and public share so the stored order matches
-    /// the post-settlement Merkle leaf.
-    pub async fn update_order_after_match(&self, order: Order) -> Result<(), SettlementError> {
-        let waiter = self.ctx.state.update_order(order).await?;
-        waiter.await.map_err(SettlementError::from)?;
-        Ok(())
-    }
-
     /// Extract and store the Merkle authentication path for a Ring 1+ order
     /// from a settlement transaction receipt
     ///
@@ -226,57 +216,29 @@ impl SettlementProcessor {
         Ok(())
     }
 
-    /// Update balances after a match settlement for any ring level
-    ///
-    /// For Ring 0/1, decrements the EOA input balance by the obligation
-    /// amount. For Ring 2, writes pre-computed darkpool input and output
-    /// balances to state.
-    pub async fn update_balances_after_match(
+    /// Apply the durable state update for a matched pair atomically
+    pub async fn apply_match_settlement(
         &self,
-        account_id: AccountId,
-        order: &Order,
-        obligation: &SettlementObligation,
-        darkpool_balances: Option<(Balance, Balance)>, // (input, output)
+        account_id0: AccountId,
+        order0: Order,
+        balances0: Option<(Balance, Balance)>,
+        account_id1: AccountId,
+        order1: Order,
+        balances1: Option<(Balance, Balance)>,
     ) -> Result<(), SettlementError> {
-        match order.ring.balance_location() {
-            BalanceLocation::EOA => self.update_eoa_balance(account_id, obligation).await,
-            BalanceLocation::Darkpool => {
-                let (in_bal, out_bal) = darkpool_balances.expect("pre-computed balances required");
-                self.update_renegade_settled_balances(account_id, in_bal, out_bal).await
-            },
-        }
-    }
+        let party0 = MatchSettlementParty {
+            account_id: account_id0,
+            order: order0,
+            balances: balances0.into_iter().flat_map(|(a, b)| [a, b]).collect(),
+        };
+        let party1 = MatchSettlementParty {
+            account_id: account_id1,
+            order: order1,
+            balances: balances1.into_iter().flat_map(|(a, b)| [a, b]).collect(),
+        };
 
-    /// Update the input balance for a given party
-    async fn update_eoa_balance(
-        &self,
-        account_id: AccountId,
-        obligation: &SettlementObligation,
-    ) -> Result<(), SettlementError> {
-        let state = &self.ctx.state;
-        let location = BalanceLocation::EOA;
-        let mut balance = self.get_balance(account_id, obligation.input_token, location).await?;
-        *balance.amount_mut() -= obligation.amount_in;
-
-        // Write the balance back to the state
-        let waiter = state.update_account_balance(account_id, balance).await?;
+        let waiter = self.ctx.state.apply_match_settlement(party0, party1).await?;
         waiter.await.map_err(SettlementError::from)?;
-        Ok(())
-    }
-
-    /// Update the input and output darkpool balances for a Renegade settled
-    /// order
-    async fn update_renegade_settled_balances(
-        &self,
-        account_id: AccountId,
-        input_balance: Balance,
-        output_balance: Balance,
-    ) -> Result<(), SettlementError> {
-        let state = &self.ctx.state;
-        let in_waiter = state.update_account_balance(account_id, input_balance).await?;
-        let out_waiter = state.update_account_balance(account_id, output_balance).await?;
-        in_waiter.await.map_err(SettlementError::from)?;
-        out_waiter.await.map_err(SettlementError::from)?;
         Ok(())
     }
 }

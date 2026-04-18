@@ -102,6 +102,9 @@ impl StateApplicator {
             StateTransition::UpdateAccountBalance { account_id, balance } => {
                 self.update_account_balance(account_id, &balance)
             },
+            StateTransition::ApplyMatchSettlement { party0, party1 } => {
+                self.apply_match_settlement(&party0, &party1)
+            },
             StateTransition::UpdateAccountKeychain { account_id, keychain } => {
                 self.update_account_keychain(account_id, &keychain)
             },
